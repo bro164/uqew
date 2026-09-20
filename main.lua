@@ -1,8 +1,9 @@
 -- ============================================================
---  PRISON LIFE | FIXED BUILD
---  Solar/Solara/Synapse X/Electron compatible
---  Fixes: silent aim, hitsound (own hits only), onetap names,
---         spin (vehicle isolation + shift fix)
+--  PRISON LIFE | v1.2 — SOLARA NATIVE BUILD
+--  Silent aim via __namecall FireServer hook
+--  Hitsound: только от своих выстрелов
+--  Onetap: Remington 870 → AK-47 / MP5
+--  Spin: без машин, без Shift-краша
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -42,24 +43,25 @@ local Config = {
 
 -- ============================================================
 --  TEAM CHECK
+--  Prison Life реальные имена команд: "Criminals" и "Police"
 -- ============================================================
 local function isEnemy(player)
     if player == LocalPlayer then return false end
     if not Config.TeamCheck then return true end
-    local myTeam    = LocalPlayer.Team
-    local theirTeam = player.Team
-    if not myTeam or not theirTeam then return true end
-    if myTeam.Name == "Criminals" and theirTeam.Name == "Police" then return true end
-    if myTeam.Name == "Police"    and theirTeam.Name == "Criminals" then return true end
-    return false
+    local mt  = LocalPlayer.Team
+    local ot  = player.Team
+    if not mt or not ot then return true end
+    if mt == ot then return false end
+    return true
 end
 
 -- ============================================================
---  CLOSEST ENEMY IN FOV
+--  CLOSEST TARGET IN FOV
 -- ============================================================
 local function getTarget()
     local best, bestDist = nil, Config.SilentAimFOV
-    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local cx = Camera.ViewportSize.X / 2
+    local cy = Camera.ViewportSize.Y / 2
     for _, plr in ipairs(Players:GetPlayers()) do
         if not isEnemy(plr) then continue end
         local char = plr.Character
@@ -67,227 +69,243 @@ local function getTarget()
         local torso = char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
         local hum   = char:FindFirstChildOfClass("Humanoid")
         if not torso or not hum or hum.Health <= 0 then continue end
-        local sp, onScreen = Camera:WorldToViewportPoint(torso.Position)
-        if not onScreen then continue end
-        local dist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-        if dist < bestDist then
-            bestDist = dist
-            best     = plr
+        local sp, vis = Camera:WorldToViewportPoint(torso.Position)
+        if not vis then continue end
+        local d = math.sqrt((sp.X - cx)^2 + (sp.Y - cy)^2)
+        if d < bestDist then
+            bestDist = d
+            best = plr
         end
     end
     return best
 end
 
--- ============================================================
---  SILENT AIM — proper method for Solar/Solara/Synapse/Electron
---  Hooks the WorldRoot raycast that tools use for hit detection
--- ============================================================
-local silentTarget = nil  -- the torso Part we redirect to
+local function getTargetTorso()
+    local t = getTarget()
+    if not t or not t.Character then return nil end
+    return t.Character:FindFirstChild("Torso") or t.Character:FindFirstChild("UpperTorso")
+end
 
--- Keep target fresh every frame
-RunService.RenderStepped:Connect(function()
-    if not Config.SilentAimEnabled then
-        silentTarget = nil
+-- ============================================================
+--  SILENT AIM — __namecall hook (Solara / Synapse / Electron)
+--  
+--  Как это работает:
+--  Prison Life оружие стреляет через Tool:Activate() →
+--  RemoteEvent:FireServer("shoot", mouseHit, ...)
+--  Перехватываем :FireServer, подменяем mouseHit на торс врага
+-- ============================================================
+local namecallHooked = false
+
+local function hookSilentAim()
+    if not getrawmetatable then
+        warn("[SA] getrawmetatable недоступен — silent aim не активен")
         return
     end
-    local enemy = getTarget()
-    if enemy and enemy.Character then
-        silentTarget = enemy.Character:FindFirstChild("Torso")
-                    or enemy.Character:FindFirstChild("UpperTorso")
-    else
-        silentTarget = nil
+
+    local mt = getrawmetatable(game)
+    if not mt then return end
+
+    -- разблокируем таблицу
+    local ok = pcall(setreadonly, mt, false)
+    if not ok then
+        -- Solara использует make_writeable на некоторых версиях
+        pcall(function()
+            if make_writeable then make_writeable(mt, true) end
+        end)
     end
-end)
 
--- Hook FindPartOnRayWithWhitelist / FindPartOnRay / Raycast
--- Solar and Synapse both expose hookfunction / hookmetamethod
-local function hookRaycast()
-    local wsmt = getrawmetatable(workspace)
-    if not wsmt then return end
+    local oldNamecall = mt.__namecall
+    if not oldNamecall then
+        pcall(setreadonly, mt, true)
+        return
+    end
 
-    local oldIndex = wsmt.__index
-    setreadonly(wsmt, false)
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        local args   = {...}
 
-    wsmt.__index = newcclosure(function(self, key)
-        -- intercept :FindPartOnRay and :FindPartOnRayWithWhitelist
-        if (key == "FindPartOnRay" or key == "FindPartOnRayWithWhitelist") then
-            return newcclosure(function(ws, ray, ...)
-                if Config.SilentAimEnabled and silentTarget then
-                    -- redirect origin + direction toward the torso
-                    local newDir = (silentTarget.Position - ray.Origin).Unit * ray.Direction.Magnitude
-                    ray = Ray.new(ray.Origin, newDir)
+        -- Перехватываем только FireServer
+        if method == "FireServer" and Config.SilentAimEnabled then
+            -- Проверяем: это RemoteEvent внутри оружия LocalPlayer?
+            if typeof(self) == "Instance" and self:IsA("RemoteEvent") then
+                local char = LocalPlayer.Character
+                local tool = char and char:FindFirstChildOfClass("Tool")
+                -- RemoteEvent должен быть потомком Tool или его скриптов
+                local isOurGun = false
+                if tool then
+                    -- Быстрая проверка: remote находится в Tool или workspace.Ignore
+                    local p = self.Parent
+                    while p and p ~= game do
+                        if p == tool or p.Name == "Guns" or p.Name == "GunEvent" then
+                            isOurGun = true
+                            break
+                        end
+                        p = p.Parent
+                    end
+                    -- Prison Life использует один глобальный RemoteEvent "shoot" или "Fire"
+                    if self.Name == "shoot" or self.Name == "Fire" or self.Name == "Shoot"
+                        or self.Name == "GunEvent" or self.Name == "RemoteEvent" then
+                        isOurGun = true
+                    end
                 end
-                return oldIndex(ws, key)(ws, ray, ...)
-            end)
+
+                if isOurGun then
+                    local torso = getTargetTorso()
+                    if torso then
+                        -- args[1] обычно это mouseHit (CFrame) или position (Vector3)
+                        -- Prison Life передаёт CFrame позиции попадания
+                        if args[1] and typeof(args[1]) == "CFrame" then
+                            args[1] = CFrame.new(torso.Position)
+                        elseif args[1] and typeof(args[1]) == "Vector3" then
+                            args[1] = torso.Position
+                        end
+                        -- args[2] может быть Part (hit part) — ставим торс
+                        if args[2] and typeof(args[2]) == "Instance" then
+                            args[2] = torso
+                        end
+                    end
+                end
+            end
         end
-        return oldIndex(self, key)
+
+        return oldNamecall(self, table.unpack(args))
     end)
 
-    setreadonly(wsmt, true)
+    pcall(setreadonly, mt, true)
+    namecallHooked = true
 end
 
--- Raycast() hook (newer executor / game path)
-local function hookRaycastMethod()
-    if not hookfunction then return end
-    local oldRaycast = workspace.Raycast
-    hookfunction(workspace.Raycast, newcclosure(function(ws, origin, direction, params)
-        if Config.SilentAimEnabled and silentTarget then
-            direction = (silentTarget.Position - origin).Unit * direction.Magnitude
-        end
-        return oldRaycast(ws, origin, direction, params)
-    end))
-end
-
-pcall(hookRaycast)
-pcall(hookRaycastMethod)
+pcall(hookSilentAim)
 
 -- ============================================================
---  HITSOUND — fires ONLY when LocalPlayer's tool deals damage
---  Tracks health of enemies; compares against last known value
---  but gates on: did LocalPlayer fire in the last 0.8s?
+--  HITSOUND — только от LocalPlayer
+--  Отслеживаем: LocalPlayer активировал Tool → засекаем время
+--  HP врага упал в течении FIRE_WINDOW → хитсаунд
 -- ============================================================
 local HitSound = Instance.new("Sound")
 HitSound.SoundId = "rbxassetid://" .. Config.HitsoundId
 HitSound.Volume  = 0.7
-HitSound.Parent  = game:GetService("SoundService")
+HitSound.Parent  = LocalPlayer.PlayerGui  -- PlayerGui стабильнее на Solara
 
-local lastFiredAt  = 0  -- tick() when LocalPlayer last fired a tool
-local FIRE_WINDOW  = 0.8 -- seconds; hits within this window count as ours
+local lastFired   = 0
+local FIRE_WINDOW = 0.75
 
--- Detect when LocalPlayer fires (tool Activated)
-local function watchLocalTools()
-    local function connectTool(tool)
+local function trackLocalWeapons()
+    local function hookTool(tool)
         if not tool:IsA("Tool") then return end
         tool.Activated:Connect(function()
-            lastFiredAt = tick()
+            lastFired = tick()
         end)
     end
-    local char = LocalPlayer.Character
-    if char then
-        for _, t in ipairs(char:GetChildren()) do connectTool(t) end
-        char.ChildAdded:Connect(connectTool)
+    local function hookChar(char)
+        for _, c in ipairs(char:GetChildren()) do hookTool(c) end
+        char.ChildAdded:Connect(hookTool)
     end
-    LocalPlayer.CharacterAdded:Connect(function(c)
-        for _, t in ipairs(c:GetChildren()) do connectTool(t) end
-        c.ChildAdded:Connect(connectTool)
-    end)
+    if LocalPlayer.Character then hookChar(LocalPlayer.Character) end
+    LocalPlayer.CharacterAdded:Connect(hookChar)
 end
-watchLocalTools()
+trackLocalWeapons()
 
--- Watch enemy health; play hitsound only if we fired recently
-local enemyHealthCache = {}
-
-local function watchEnemy(player)
-    local function connectHum()
-        local char = player.Character
-        if not char then return end
-        local hum = char:FindFirstChildOfClass("Humanoid")
+local hpCache = {}
+local function watchEnemy(plr)
+    local function onChar(char)
+        local hum = char:WaitForChild("Humanoid", 5)
         if not hum then return end
-        enemyHealthCache[player] = hum.Health
-        hum.HealthChanged:Connect(function(newHp)
-            local prev = enemyHealthCache[player] or newHp
-            if newHp < prev then
-                -- only play if LocalPlayer fired within the window
-                if (tick() - lastFiredAt) <= FIRE_WINDOW then
+        hpCache[plr] = hum.Health
+        hum.HealthChanged:Connect(function(hp)
+            local prev = hpCache[plr] or hp
+            if hp < prev then
+                if (tick() - lastFired) <= FIRE_WINDOW and Config.HitsoundEnabled then
                     HitSound:Stop()
                     HitSound.SoundId = "rbxassetid://" .. Config.HitsoundId
                     HitSound:Play()
                 end
             end
-            enemyHealthCache[player] = newHp
+            hpCache[plr] = hp
         end)
     end
-    connectHum()
-    player.CharacterAdded:Connect(connectHum)
+    if plr.Character then onChar(plr.Character) end
+    plr.CharacterAdded:Connect(onChar)
 end
 
-for _, plr in ipairs(Players:GetPlayers()) do
-    if plr ~= LocalPlayer then watchEnemy(plr) end
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then watchEnemy(p) end
 end
-Players.PlayerAdded:Connect(function(plr)
-    watchEnemy(plr)
-end)
+Players.PlayerAdded:Connect(function(p) watchEnemy(p) end)
 
 -- ============================================================
 --  ONETAP — Remington 870 → AK-47 / MP5 fallback
 -- ============================================================
-local ONETAP_SHOTGUN    = "Remington 870"
-local ONETAP_SECONDARY  = {"AK-47", "MP5"}  -- tries AK first, MP5 fallback
+local SHOTGUN    = "Remington 870"
+local SECONDARIES = {"AK-47", "MP5"}
 local otBusy = false
 
-local function equipTool(name)
+local function equipByName(name)
     local char     = LocalPlayer.Character
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
     if not char or not backpack then return false end
-    local tool = char:FindFirstChild(name) or backpack:FindFirstChild(name)
-    if tool then
-        LocalPlayer.Character.Humanoid:EquipTool(tool)
+    local t = char:FindFirstChild(name) or backpack:FindFirstChild(name)
+    if t and char:FindFirstChildOfClass("Humanoid") then
+        char:FindFirstChildOfClass("Humanoid"):EquipTool(t)
         return true
     end
     return false
 end
 
-local function onetap()
+local function runOnetap()
     if otBusy or not Config.OnetapEnabled then return end
     if not getTarget() then return end
     otBusy = true
-    equipTool(ONETAP_SHOTGUN)
-    task.wait(0.06)
-    -- fire moment handled by mouse click; swap immediately after
-    task.wait(0.16)
-    local swapped = equipTool(ONETAP_SECONDARY[1])
-    if not swapped then equipTool(ONETAP_SECONDARY[2]) end
-    task.wait(0.45)
+    equipByName(SHOTGUN)
+    task.wait(0.05)
+    task.wait(0.17)
+    if not equipByName(SECONDARIES[1]) then
+        equipByName(SECONDARIES[2])
+    end
+    task.wait(0.5)
     otBusy = false
 end
 
 UserInputService.InputBegan:Connect(function(inp, gp)
     if gp then return end
     if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-        if Config.OnetapEnabled and Config.SilentAimEnabled and getTarget() then
-            task.spawn(onetap)
+        if Config.SilentAimEnabled and Config.OnetapEnabled and getTarget() then
+            task.spawn(runOnetap)
         end
     end
 end)
 
 -- ============================================================
---  SPIN — isolated from vehicle + Shift key fix
+--  SPIN — изолирован от машины + Shift fix
 -- ============================================================
 local spinConn = nil
 
-local function isInVehicle()
+local function inVehicle()
     local char = LocalPlayer.Character
     if not char then return false end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return false end
-    -- If HRP's parent is a VehicleSeat or we have a VehicleSeat as an ancestor
-    local seat = char:FindFirstChildOfClass("VehicleSeat")
-    if seat then return true end
-    -- Check if seated in any external vehicle
     local hum = char:FindFirstChildOfClass("Humanoid")
     if hum and hum.SeatPart and hum.SeatPart:IsA("VehicleSeat") then return true end
+    if char:FindFirstChildOfClass("VehicleSeat") then return true end
     return false
 end
 
 local function startSpin()
     if spinConn then spinConn:Disconnect() end
     spinConn = RunService.Heartbeat:Connect(function()
-        -- pause while in vehicle
-        if isInVehicle() then return end
+        if inVehicle() then return end
         local char = LocalPlayer.Character
         if not char then return end
         local hrp = char:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
-        -- Shift lock fix: detach from camera direction, apply absolute rotation
-        hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(Config.SpinSpeed), 0)
+        -- Используем CFrame напрямую, игнорируя camera offset (Shift Lock fix)
+        hrp.CFrame = CFrame.new(hrp.Position)
+            * CFrame.Angles(0, math.rad(Config.SpinSpeed), 0)
+            * CFrame.new(0, 0, 0)
     end)
 end
 
 local function stopSpin()
-    if spinConn then
-        spinConn:Disconnect()
-        spinConn = nil
-    end
+    if spinConn then spinConn:Disconnect(); spinConn = nil end
 end
 
 -- ============================================================
@@ -297,21 +315,30 @@ local function applyFog()
     local L    = game:GetService("Lighting")
     local atmo = L:FindFirstChildOfClass("Atmosphere")
     if Config.FogEnabled then
-        L.FogStart  = Config.FogStart
-        L.FogEnd    = Config.FogEnd
-        L.FogColor  = Config.FogColor
+        L.FogStart = Config.FogStart
+        L.FogEnd   = Config.FogEnd
+        L.FogColor = Config.FogColor
         if atmo then atmo.Density = Config.FogDensity end
     else
-        L.FogEnd = 100000
+        L.FogEnd   = 100000
         L.FogStart = 0
         if atmo then atmo.Density = 0.395 end
     end
 end
 
 -- ============================================================
---  DRAWING — FOV circle + target circle
+--  DRAWING — FOV + target circle
 -- ============================================================
 local fovCircle, targetCircle
+local silentTorso = nil
+
+RunService.RenderStepped:Connect(function()
+    if Config.SilentAimEnabled then
+        silentTorso = getTargetTorso()
+    else
+        silentTorso = nil
+    end
+end)
 
 if Drawing then
     fovCircle = Drawing.new("Circle")
@@ -329,42 +356,42 @@ if Drawing then
     targetCircle.Filled    = false
     targetCircle.NumSides  = 48
     targetCircle.Visible   = false
+
+    RunService.RenderStepped:Connect(function()
+        local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        if fovCircle then
+            fovCircle.Position = center
+            fovCircle.Radius   = Config.SilentAimFOV
+            fovCircle.Visible  = Config.SilentAimEnabled
+        end
+        if targetCircle then
+            if silentTorso and silentTorso.Parent then
+                local sp, vis = Camera:WorldToViewportPoint(silentTorso.Position)
+                targetCircle.Visible  = vis and Config.ShowCircle
+                targetCircle.Position = Vector2.new(sp.X, sp.Y)
+                targetCircle.Color    = Config.CircleColor
+            else
+                targetCircle.Visible = false
+            end
+        end
+    end)
 end
 
-RunService.RenderStepped:Connect(function()
-    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
-    if fovCircle then
-        fovCircle.Position = center
-        fovCircle.Radius   = Config.SilentAimFOV
-        fovCircle.Visible  = Config.SilentAimEnabled
-    end
-    if targetCircle then
-        if silentTarget and silentTarget.Parent then
-            local sp, onScreen = Camera:WorldToViewportPoint(silentTarget.Position)
-            targetCircle.Visible  = onScreen and Config.ShowCircle
-            targetCircle.Position = Vector2.new(sp.X, sp.Y)
-        else
-            targetCircle.Visible = false
-        end
-    end
-end)
-
 -- ============================================================
---  NEVERLOSE-STYLE GUI  (same structure, kept intact)
+--  GUI (neverlose style — полная копия v1.1, без изменений UI)
 -- ============================================================
-local TweenService = game:GetService("TweenService")
-
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name           = "PrisonLifeMenu"
 ScreenGui.ResetOnSpawn   = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.IgnoreGuiInset = true
 
-if syn and syn.protect_gui then
+-- Solara: gethui() — правильный способ
+if gethui then
+    ScreenGui.Parent = gethui()
+elseif syn and syn.protect_gui then
     syn.protect_gui(ScreenGui)
     ScreenGui.Parent = game:GetService("CoreGui")
-elseif gethui then
-    ScreenGui.Parent = gethui()
 else
     ScreenGui.Parent = game:GetService("CoreGui")
 end
@@ -384,276 +411,168 @@ local C = {
     input_bg  = Color3.fromRGB(20,  20,  28),
 }
 
-local function tw(obj, props, t, s, d)
-    return TweenService:Create(obj, TweenInfo.new(t or 0.18,
-        s or Enum.EasingStyle.Quart, d or Enum.EasingDirection.Out), props)
-end
-local function rnd(p, r) local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 6); c.Parent = p end
-local function stk(p, col, th) local s = Instance.new("UIStroke"); s.Color = col or C.border; s.Thickness = th or 1; s.Parent = p end
-local function pad(p, x, y) local u = Instance.new("UIPadding"); u.PaddingLeft=UDim.new(0,x or 8); u.PaddingRight=UDim.new(0,x or 8); u.PaddingTop=UDim.new(0,y or 6); u.PaddingBottom=UDim.new(0,y or 6); u.Parent=p end
-local function lbl(parent, text, sz, col, fnt, xa)
-    local l = Instance.new("TextLabel")
-    l.Text=text; l.TextSize=sz or 13; l.TextColor3=col or C.text
-    l.Font=fnt or Enum.Font.GothamMedium
-    l.TextXAlignment=xa or Enum.TextXAlignment.Left
-    l.BackgroundTransparency=1
-    l.Size=UDim2.new(1,0,0,(sz or 13)+6)
-    l.Parent=parent; return l
-end
+local function tw(o,p,t,s,d) return TweenService:Create(o,TweenInfo.new(t or .18,s or Enum.EasingStyle.Quart,d or Enum.EasingDirection.Out),p) end
+local function rnd(p,r) local c=Instance.new("UICorner");c.CornerRadius=UDim.new(0,r or 6);c.Parent=p end
+local function stk(p,col,th) local s=Instance.new("UIStroke");s.Color=col or C.border;s.Thickness=th or 1;s.Parent=p end
+local function pad(p,x,y) local u=Instance.new("UIPadding");u.PaddingLeft=UDim.new(0,x or 8);u.PaddingRight=UDim.new(0,x or 8);u.PaddingTop=UDim.new(0,y or 6);u.PaddingBottom=UDim.new(0,y or 6);u.Parent=p end
+local function lbl(parent,text,sz,col,fnt,xa) local l=Instance.new("TextLabel");l.Text=text;l.TextSize=sz or 13;l.TextColor3=col or C.text;l.Font=fnt or Enum.Font.GothamMedium;l.TextXAlignment=xa or Enum.TextXAlignment.Left;l.BackgroundTransparency=1;l.Size=UDim2.new(1,0,0,(sz or 13)+6);l.Parent=parent;return l end
 
--- Window
-local Win = Instance.new("Frame")
-Win.Size=UDim2.new(0,560,0,380); Win.Position=UDim2.new(0.5,-280,0.5,-190)
-Win.BackgroundColor3=C.bg; Win.ClipsDescendants=true; Win.Parent=ScreenGui
-rnd(Win,10); stk(Win,C.border,1)
+local Win=Instance.new("Frame")
+Win.Size=UDim2.new(0,560,0,380);Win.Position=UDim2.new(0.5,-280,0.5,-190)
+Win.BackgroundColor3=C.bg;Win.ClipsDescendants=true;Win.Parent=ScreenGui
+rnd(Win,10);stk(Win,C.border,1)
+local wg=Instance.new("UIGradient");wg.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(22,22,32)),ColorSequenceKeypoint.new(1,Color3.fromRGB(10,10,14))});wg.Rotation=120;wg.Parent=Win
 
-local wGrad=Instance.new("UIGradient")
-wGrad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(22,22,32)),ColorSequenceKeypoint.new(1,Color3.fromRGB(10,10,14))})
-wGrad.Rotation=120; wGrad.Parent=Win
+local TBar=Instance.new("Frame");TBar.Size=UDim2.new(1,0,0,42);TBar.BackgroundColor3=C.surface;TBar.ZIndex=3;TBar.Parent=Win;rnd(TBar,10);stk(TBar,C.border,1)
+local TBF=Instance.new("Frame");TBF.Size=UDim2.new(1,0,0,10);TBF.Position=UDim2.new(0,0,1,-10);TBF.BackgroundColor3=C.surface;TBF.BorderSizePixel=0;TBF.ZIndex=3;TBF.Parent=TBar
+local AL=Instance.new("Frame");AL.Size=UDim2.new(0,80,0,2);AL.Position=UDim2.new(0,14,1,-1);AL.BackgroundColor3=C.accent;AL.BorderSizePixel=0;AL.ZIndex=4;AL.Parent=TBar;rnd(AL,2)
 
--- Title bar
-local TBar=Instance.new("Frame")
-TBar.Size=UDim2.new(1,0,0,42); TBar.BackgroundColor3=C.surface; TBar.ZIndex=3; TBar.Parent=Win
-rnd(TBar,10); stk(TBar,C.border,1)
+local function tbL(t,sz,col,fnt,xa,w,pos,zi) local l=Instance.new("TextLabel");l.Text=t;l.TextSize=sz;l.TextColor3=col;l.Font=fnt;l.BackgroundTransparency=1;l.Size=UDim2.new(0,w,1,0);l.Position=pos;l.TextXAlignment=xa;l.ZIndex=zi;l.Parent=TBar;return l end
+tbL("⚡",15,C.accent,Enum.Font.GothamBold,Enum.TextXAlignment.Center,24,UDim2.new(0,12,0,9),4)
+tbL("Prison Life",14,C.text,Enum.Font.GothamBold,Enum.TextXAlignment.Left,130,UDim2.new(0,38,0,0),4)
+tbL("v1.2  |  Solara",11,C.textDim,Enum.Font.Gotham,Enum.TextXAlignment.Left,110,UDim2.new(0,162,0,0),4)
 
-local TBarFix=Instance.new("Frame")
-TBarFix.Size=UDim2.new(1,0,0,10); TBarFix.Position=UDim2.new(0,0,1,-10)
-TBarFix.BackgroundColor3=C.surface; TBarFix.BorderSizePixel=0; TBarFix.ZIndex=3; TBarFix.Parent=TBar
+local drag,ds,sp2=false,nil,nil
+TBar.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=true;ds=i.Position;sp2=Win.Position end end)
+TBar.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end end)
+UserInputService.InputChanged:Connect(function(i) if drag and i.UserInputType==Enum.UserInputType.MouseMovement then local d=i.Position-ds;Win.Position=UDim2.new(sp2.X.Scale,sp2.X.Offset+d.X,sp2.Y.Scale,sp2.Y.Offset+d.Y) end end)
 
-local AccLine=Instance.new("Frame")
-AccLine.Size=UDim2.new(0,80,0,2); AccLine.Position=UDim2.new(0,14,1,-1)
-AccLine.BackgroundColor3=C.accent; AccLine.BorderSizePixel=0; AccLine.ZIndex=4; AccLine.Parent=TBar
-rnd(AccLine,2)
+local Side=Instance.new("Frame");Side.Size=UDim2.new(0,110,1,-42);Side.Position=UDim2.new(0,0,0,42);Side.BackgroundColor3=C.surface;Side.ZIndex=2;Side.Parent=Win
+local Div=Instance.new("Frame");Div.Size=UDim2.new(0,1,1,0);Div.Position=UDim2.new(1,-1,0,0);Div.BackgroundColor3=C.border;Div.BorderSizePixel=0;Div.ZIndex=2;Div.Parent=Side
+local SL=Instance.new("Frame");SL.Size=UDim2.new(1,0,1,0);SL.BackgroundTransparency=1;SL.ZIndex=3;SL.Parent=Side
+local SLL=Instance.new("UIListLayout");SLL.SortOrder=Enum.SortOrder.LayoutOrder;SLL.Padding=UDim.new(0,2);SLL.Parent=SL;pad(SL,6,8)
 
-local function tbLabel(text,size,col,font,x,w,pos,zi)
-    local t=Instance.new("TextLabel")
-    t.Text=text;t.TextSize=size;t.TextColor3=col;t.Font=font or Enum.Font.Gotham
-    t.BackgroundTransparency=1;t.Size=UDim2.new(0,w,1,0)
-    t.Position=pos;t.TextXAlignment=x or Enum.TextXAlignment.Left
-    t.ZIndex=zi or 4;t.Parent=TBar;return t
-end
-tbLabel("⚡",15,C.accent,Enum.Font.GothamBold,Enum.TextXAlignment.Center,24,UDim2.new(0,12,0,9),4)
-tbLabel("Prison Life",14,C.text,Enum.Font.GothamBold,Enum.TextXAlignment.Left,120,UDim2.new(0,38,0,0),4)
-tbLabel("v1.1  |  Solar",11,C.textDim,Enum.Font.Gotham,Enum.TextXAlignment.Left,100,UDim2.new(0,150,0,0),4)
+local Content=Instance.new("Frame");Content.Size=UDim2.new(1,-110,1,-42);Content.Position=UDim2.new(0,110,0,42);Content.BackgroundColor3=C.panel;Content.ZIndex=2;Content.Parent=Win
 
-local dragging,dragStart,startPos=false,nil,nil
-TBar.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true;dragStart=i.Position;startPos=Win.Position end end)
-TBar.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end)
-UserInputService.InputChanged:Connect(function(i) if dragging and i.UserInputType==Enum.UserInputType.MouseMovement then local d=i.Position-dragStart;Win.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y) end end)
+local Tabs,TBtns,Active={},{},nil
+local TABS={"Aim","Main","Rage","Settings"}
+local ICONS={"🎯","🌫️","💀","⚙️"}
 
--- Tab sidebar
-local TBSide=Instance.new("Frame")
-TBSide.Size=UDim2.new(0,110,1,-42);TBSide.Position=UDim2.new(0,0,0,42)
-TBSide.BackgroundColor3=C.surface;TBSide.ZIndex=2;TBSide.Parent=Win
-
-local Divider=Instance.new("Frame")
-Divider.Size=UDim2.new(0,1,1,0);Divider.Position=UDim2.new(1,-1,0,0)
-Divider.BackgroundColor3=C.border;Divider.BorderSizePixel=0;Divider.ZIndex=2;Divider.Parent=TBSide
-
-local TBList=Instance.new("Frame")
-TBList.Size=UDim2.new(1,0,1,0);TBList.BackgroundTransparency=1;TBList.ZIndex=3;TBList.Parent=TBSide
-local TBListL=Instance.new("UIListLayout");TBListL.SortOrder=Enum.SortOrder.LayoutOrder;TBListL.Padding=UDim.new(0,2);TBListL.Parent=TBList
-pad(TBList,6,8)
-
--- Content
-local Content=Instance.new("Frame")
-Content.Size=UDim2.new(1,-110,1,-42);Content.Position=UDim2.new(0,110,0,42)
-Content.BackgroundColor3=C.panel;Content.ZIndex=2;Content.Parent=Win
-
--- Tab builders
-local Tabs,TabBtns,ActiveTab={},{},nil
-
-local function setTab(name)
-    ActiveTab=name
-    for n,pg in pairs(Tabs) do pg.Visible=(n==name) end
-    for n,b  in pairs(TabBtns) do
-        local on=(n==name)
-        tw(b,{BackgroundColor3=on and C.accentDim or Color3.fromRGB(0,0,0), BackgroundTransparency=on and 0 or 1},0.15):Play()
+local function setTab(n)
+    Active=n
+    for k,p in pairs(Tabs) do p.Visible=(k==n) end
+    for k,b in pairs(TBtns) do
+        local on=(k==n)
+        tw(b,{BackgroundColor3=on and C.accentDim or Color3.fromRGB(0,0,0),BackgroundTransparency=on and 0 or 1},.15):Play()
         b.TextColor3=on and C.text or C.textDim
     end
 end
 
-local TAB_NAMES={"Aim","Main","Rage","Settings"}
-local TAB_ICONS={"🎯","🌫️","💀","⚙️"}
-
-for i,tabName in ipairs(TAB_NAMES) do
-    local pg=Instance.new("ScrollingFrame")
-    pg.Name=tabName;pg.Size=UDim2.new(1,0,1,0);pg.BackgroundTransparency=1
-    pg.ScrollBarThickness=3;pg.ScrollBarImageColor3=C.accent
-    pg.CanvasSize=UDim2.new(0,0,0,0);pg.AutomaticCanvasSize=Enum.AutomaticSize.Y
-    pg.Visible=false;pg.ZIndex=3;pg.Parent=Content
-    pad(pg,12,10)
-    local pL=Instance.new("UIListLayout");pL.SortOrder=Enum.SortOrder.LayoutOrder;pL.Padding=UDim.new(0,6);pL.Parent=pg
-    Tabs[tabName]=pg
-
-    local btn=Instance.new("TextButton")
-    btn.Size=UDim2.new(1,0,0,32);btn.BackgroundTransparency=1
-    btn.Font=Enum.Font.GothamMedium;btn.TextSize=13;btn.TextColor3=C.textDim
-    btn.TextXAlignment=Enum.TextXAlignment.Left
-    btn.Text="  "..TAB_ICONS[i].."  "..tabName
-    btn.ZIndex=4;btn.LayoutOrder=i;btn.Parent=TBList
-    rnd(btn,6)
-    btn.MouseEnter:Connect(function() if ActiveTab~=tabName then tw(btn,{TextColor3=C.text},0.1):Play() end end)
-    btn.MouseLeave:Connect(function() if ActiveTab~=tabName then tw(btn,{TextColor3=C.textDim},0.1):Play() end end)
-    btn.MouseButton1Click:Connect(function() setTab(tabName) end)
-    TabBtns[tabName]=btn
+for i,name in ipairs(TABS) do
+    local pg=Instance.new("ScrollingFrame");pg.Name=name;pg.Size=UDim2.new(1,0,1,0);pg.BackgroundTransparency=1;pg.ScrollBarThickness=3;pg.ScrollBarImageColor3=C.accent;pg.CanvasSize=UDim2.new(0,0,0,0);pg.AutomaticCanvasSize=Enum.AutomaticSize.Y;pg.Visible=false;pg.ZIndex=3;pg.Parent=Content;pad(pg,12,10)
+    local pl=Instance.new("UIListLayout");pl.SortOrder=Enum.SortOrder.LayoutOrder;pl.Padding=UDim.new(0,6);pl.Parent=pg
+    Tabs[name]=pg
+    local b=Instance.new("TextButton");b.Size=UDim2.new(1,0,0,32);b.BackgroundTransparency=1;b.Font=Enum.Font.GothamMedium;b.TextSize=13;b.TextColor3=C.textDim;b.TextXAlignment=Enum.TextXAlignment.Left;b.Text="  "..ICONS[i].."  "..name;b.ZIndex=4;b.LayoutOrder=i;b.Parent=SL;rnd(b,6)
+    b.MouseEnter:Connect(function() if Active~=name then tw(b,{TextColor3=C.text},.1):Play() end end)
+    b.MouseLeave:Connect(function() if Active~=name then tw(b,{TextColor3=C.textDim},.1):Play() end end)
+    b.MouseButton1Click:Connect(function() setTab(name) end)
+    TBtns[name]=b
 end
 
--- Component helpers
-local function makeSection(parent,title,order)
-    local w=Instance.new("Frame")
-    w.Size=UDim2.new(1,0,0,0);w.BackgroundColor3=C.surface
-    w.AutomaticSize=Enum.AutomaticSize.Y;w.ZIndex=4
-    w.LayoutOrder=order or 1;w.Parent=parent
-    rnd(w,8);stk(w,C.border,1);pad(w,10,8)
-    local wL=Instance.new("UIListLayout");wL.SortOrder=Enum.SortOrder.LayoutOrder;wL.Padding=UDim.new(0,6);wL.Parent=w
+local function sec(par,title,order)
+    local w=Instance.new("Frame");w.Size=UDim2.new(1,0,0,0);w.BackgroundColor3=C.surface;w.AutomaticSize=Enum.AutomaticSize.Y;w.ZIndex=4;w.LayoutOrder=order or 1;w.Parent=par;rnd(w,8);stk(w,C.border,1);pad(w,10,8)
+    local wl=Instance.new("UIListLayout");wl.SortOrder=Enum.SortOrder.LayoutOrder;wl.Padding=UDim.new(0,6);wl.Parent=w
     if title then
-        local hdr=Instance.new("Frame");hdr.Size=UDim2.new(1,0,0,22);hdr.BackgroundTransparency=1;hdr.LayoutOrder=0;hdr.ZIndex=5;hdr.Parent=w
-        local hl=Instance.new("Frame");hl.Size=UDim2.new(0,3,0,14);hl.Position=UDim2.new(0,0,0.5,-7);hl.BackgroundColor3=C.accent;hl.BorderSizePixel=0;hl.ZIndex=6;hl.Parent=hdr;rnd(hl,2)
-        local ht=Instance.new("TextLabel");ht.Text=title;ht.TextSize=11;ht.Font=Enum.Font.GothamBold;ht.TextColor3=C.textDim;ht.BackgroundTransparency=1;ht.Size=UDim2.new(1,-14,1,0);ht.Position=UDim2.new(0,10,0,0);ht.TextXAlignment=Enum.TextXAlignment.Left;ht.ZIndex=6;ht.Parent=hdr
+        local h=Instance.new("Frame");h.Size=UDim2.new(1,0,0,22);h.BackgroundTransparency=1;h.LayoutOrder=0;h.ZIndex=5;h.Parent=w
+        local hl=Instance.new("Frame");hl.Size=UDim2.new(0,3,0,14);hl.Position=UDim2.new(0,0,0.5,-7);hl.BackgroundColor3=C.accent;hl.BorderSizePixel=0;hl.ZIndex=6;hl.Parent=h;rnd(hl,2)
+        local ht=Instance.new("TextLabel");ht.Text=title;ht.TextSize=11;ht.Font=Enum.Font.GothamBold;ht.TextColor3=C.textDim;ht.BackgroundTransparency=1;ht.Size=UDim2.new(1,-14,1,0);ht.Position=UDim2.new(0,10,0,0);ht.TextXAlignment=Enum.TextXAlignment.Left;ht.ZIndex=6;ht.Parent=h
     end
     return w
 end
 
-local function makeToggle(parent,text,default,callback,order)
-    local row=Instance.new("Frame");row.Size=UDim2.new(1,0,0,28);row.BackgroundTransparency=1;row.LayoutOrder=order or 1;row.ZIndex=5;row.Parent=parent
+local function tog(par,text,def,cb,order)
+    local row=Instance.new("Frame");row.Size=UDim2.new(1,0,0,28);row.BackgroundTransparency=1;row.LayoutOrder=order or 1;row.ZIndex=5;row.Parent=par
     local l=Instance.new("TextLabel");l.Text=text;l.TextSize=13;l.Font=Enum.Font.GothamMedium;l.TextColor3=C.text;l.BackgroundTransparency=1;l.Size=UDim2.new(1,-48,1,0);l.TextXAlignment=Enum.TextXAlignment.Left;l.ZIndex=6;l.Parent=row
-    local track=Instance.new("Frame");track.Size=UDim2.new(0,36,0,18);track.Position=UDim2.new(1,-38,0.5,-9);track.BackgroundColor3=default and C.tog_on or C.tog_off;track.ZIndex=6;track.Parent=row;rnd(track,9);stk(track,C.border,1)
-    local knob=Instance.new("Frame");knob.Size=UDim2.new(0,12,0,12);knob.Position=default and UDim2.new(1,-15,0.5,-6) or UDim2.new(0,3,0.5,-6);knob.BackgroundColor3=Color3.new(1,1,1);knob.ZIndex=7;knob.Parent=track;rnd(knob,6)
-    local state=default
+    local tr=Instance.new("Frame");tr.Size=UDim2.new(0,36,0,18);tr.Position=UDim2.new(1,-38,0.5,-9);tr.BackgroundColor3=def and C.tog_on or C.tog_off;tr.ZIndex=6;tr.Parent=row;rnd(tr,9);stk(tr,C.border,1)
+    local kn=Instance.new("Frame");kn.Size=UDim2.new(0,12,0,12);kn.Position=def and UDim2.new(1,-15,0.5,-6) or UDim2.new(0,3,0.5,-6);kn.BackgroundColor3=Color3.new(1,1,1);kn.ZIndex=7;kn.Parent=tr;rnd(kn,6)
+    local st=def
     local btn=Instance.new("TextButton");btn.Size=UDim2.new(1,0,1,0);btn.BackgroundTransparency=1;btn.Text="";btn.ZIndex=8;btn.Parent=row
     btn.MouseButton1Click:Connect(function()
-        state=not state
-        tw(track,{BackgroundColor3=state and C.tog_on or C.tog_off},0.15):Play()
-        tw(knob,{Position=state and UDim2.new(1,-15,0.5,-6) or UDim2.new(0,3,0.5,-6)},0.15):Play()
-        callback(state)
+        st=not st
+        tw(tr,{BackgroundColor3=st and C.tog_on or C.tog_off},.15):Play()
+        tw(kn,{Position=st and UDim2.new(1,-15,0.5,-6) or UDim2.new(0,3,0.5,-6)},.15):Play()
+        cb(st)
     end)
-    return row
 end
 
-local function makeSlider(parent,text,min,max,default,callback,order)
-    local wrap=Instance.new("Frame");wrap.Size=UDim2.new(1,0,0,44);wrap.BackgroundTransparency=1;wrap.LayoutOrder=order or 1;wrap.ZIndex=5;wrap.Parent=parent
-    local l=Instance.new("TextLabel");l.Text=text;l.TextSize=13;l.Font=Enum.Font.GothamMedium;l.TextColor3=C.text;l.BackgroundTransparency=1;l.Size=UDim2.new(0.7,0,0,18);l.TextXAlignment=Enum.TextXAlignment.Left;l.ZIndex=6;l.Parent=wrap
-    local vl=Instance.new("TextLabel");vl.Text=tostring(default);vl.TextSize=12;vl.Font=Enum.Font.GothamMedium;vl.TextColor3=C.accent;vl.BackgroundTransparency=1;vl.Size=UDim2.new(0.3,0,0,18);vl.TextXAlignment=Enum.TextXAlignment.Right;vl.ZIndex=6;vl.Parent=wrap
-    local track=Instance.new("Frame");track.Size=UDim2.new(1,0,0,6);track.Position=UDim2.new(0,0,0,26);track.BackgroundColor3=C.slider_bg;track.ZIndex=6;track.Parent=wrap;rnd(track,3);stk(track,C.border,1)
-    local fill=Instance.new("Frame");fill.Size=UDim2.new((default-min)/(max-min),0,1,0);fill.BackgroundColor3=C.accent;fill.ZIndex=7;fill.Parent=track;rnd(fill,3)
-    local handle=Instance.new("Frame");handle.Size=UDim2.new(0,12,0,12);handle.AnchorPoint=Vector2.new(0.5,0.5);handle.Position=UDim2.new((default-min)/(max-min),0,0.5,0);handle.BackgroundColor3=Color3.new(1,1,1);handle.ZIndex=8;handle.Parent=track;rnd(handle,6)
-    local ds=false
-    local function upd(inp)
-        local rel=math.clamp((inp.Position.X-track.AbsolutePosition.X)/track.AbsoluteSize.X,0,1)
-        local val=math.floor(min+(max-min)*rel)
-        fill.Size=UDim2.new(rel,0,1,0);handle.Position=UDim2.new(rel,0,0.5,0);vl.Text=tostring(val);callback(val)
-    end
-    track.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ds=true;upd(i) end end)
-    UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ds=false end end)
-    UserInputService.InputChanged:Connect(function(i) if ds and i.UserInputType==Enum.UserInputType.MouseMovement then upd(i) end end)
-    return wrap
+local function slider(par,text,mn,mx,def,cb,order)
+    local w=Instance.new("Frame");w.Size=UDim2.new(1,0,0,44);w.BackgroundTransparency=1;w.LayoutOrder=order or 1;w.ZIndex=5;w.Parent=par
+    local l=Instance.new("TextLabel");l.Text=text;l.TextSize=13;l.Font=Enum.Font.GothamMedium;l.TextColor3=C.text;l.BackgroundTransparency=1;l.Size=UDim2.new(0.7,0,0,18);l.TextXAlignment=Enum.TextXAlignment.Left;l.ZIndex=6;l.Parent=w
+    local vl=Instance.new("TextLabel");vl.Text=tostring(def);vl.TextSize=12;vl.Font=Enum.Font.GothamMedium;vl.TextColor3=C.accent;vl.BackgroundTransparency=1;vl.Size=UDim2.new(0.3,0,0,18);vl.TextXAlignment=Enum.TextXAlignment.Right;vl.ZIndex=6;vl.Parent=w
+    local tr=Instance.new("Frame");tr.Size=UDim2.new(1,0,0,6);tr.Position=UDim2.new(0,0,0,26);tr.BackgroundColor3=C.slider_bg;tr.ZIndex=6;tr.Parent=w;rnd(tr,3);stk(tr,C.border,1)
+    local fi=Instance.new("Frame");fi.Size=UDim2.new((def-mn)/(mx-mn),0,1,0);fi.BackgroundColor3=C.accent;fi.ZIndex=7;fi.Parent=tr;rnd(fi,3)
+    local hd=Instance.new("Frame");hd.Size=UDim2.new(0,12,0,12);hd.AnchorPoint=Vector2.new(0.5,0.5);hd.Position=UDim2.new((def-mn)/(mx-mn),0,0.5,0);hd.BackgroundColor3=Color3.new(1,1,1);hd.ZIndex=8;hd.Parent=tr;rnd(hd,6)
+    local ds2=false
+    local function upd(i) local r=math.clamp((i.Position.X-tr.AbsolutePosition.X)/tr.AbsoluteSize.X,0,1);local v=math.floor(mn+(mx-mn)*r);fi.Size=UDim2.new(r,0,1,0);hd.Position=UDim2.new(r,0,0.5,0);vl.Text=tostring(v);cb(v) end
+    tr.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ds2=true;upd(i) end end)
+    UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ds2=false end end)
+    UserInputService.InputChanged:Connect(function(i) if ds2 and i.UserInputType==Enum.UserInputType.MouseMovement then upd(i) end end)
 end
 
-local function makeInput(parent,text,default,callback,order)
-    local wrap=Instance.new("Frame");wrap.Size=UDim2.new(1,0,0,52);wrap.BackgroundTransparency=1;wrap.LayoutOrder=order or 1;wrap.ZIndex=5;wrap.Parent=parent
-    lbl(wrap,text,13,C.text,Enum.Font.GothamMedium).ZIndex=6
-    local box=Instance.new("TextBox");box.Size=UDim2.new(1,0,0,26);box.Position=UDim2.new(0,0,0,22);box.BackgroundColor3=C.input_bg;box.TextColor3=C.text;box.PlaceholderColor3=C.textDim;box.Font=Enum.Font.Gotham;box.TextSize=12;box.Text=tostring(default);box.ClearTextOnFocus=false;box.ZIndex=6;box.Parent=wrap;rnd(box,5);stk(box,C.border,1);pad(box,8,0)
-    box.FocusLost:Connect(function() callback(box.Text) end)
-    return wrap
+local function inp(par,text,def,cb,order)
+    local w=Instance.new("Frame");w.Size=UDim2.new(1,0,0,52);w.BackgroundTransparency=1;w.LayoutOrder=order or 1;w.ZIndex=5;w.Parent=par
+    lbl(w,text,13,C.text,Enum.Font.GothamMedium).ZIndex=6
+    local b=Instance.new("TextBox");b.Size=UDim2.new(1,0,0,26);b.Position=UDim2.new(0,0,0,22);b.BackgroundColor3=C.input_bg;b.TextColor3=C.text;b.PlaceholderColor3=C.textDim;b.Font=Enum.Font.Gotham;b.TextSize=12;b.Text=tostring(def);b.ClearTextOnFocus=false;b.ZIndex=6;b.Parent=w;rnd(b,5);stk(b,C.border,1);pad(b,8,0)
+    b.FocusLost:Connect(function() cb(b.Text) end)
 end
 
-local function makeDropdown(parent,text,options,default,callback,order)
-    local wrap=Instance.new("Frame");wrap.Size=UDim2.new(1,0,0,52);wrap.BackgroundTransparency=1;wrap.LayoutOrder=order or 1;wrap.ZIndex=5;wrap.ClipsDescendants=false;wrap.Parent=parent
-    lbl(wrap,text,13,C.text,Enum.Font.GothamMedium).ZIndex=6
-    local open=false
-    local sel=Instance.new("TextButton");sel.Size=UDim2.new(1,0,0,26);sel.Position=UDim2.new(0,0,0,22);sel.BackgroundColor3=C.input_bg;sel.TextColor3=C.text;sel.Font=Enum.Font.GothamMedium;sel.TextSize=12;sel.Text="  "..default;sel.TextXAlignment=Enum.TextXAlignment.Left;sel.ZIndex=7;sel.Parent=wrap;rnd(sel,5);stk(sel,C.border,1)
-    local arr=Instance.new("TextLabel");arr.Text="▾";arr.TextSize=12;arr.Font=Enum.Font.GothamBold;arr.TextColor3=C.textDim;arr.BackgroundTransparency=1;arr.Size=UDim2.new(0,20,1,0);arr.Position=UDim2.new(1,-22,0,0);arr.TextXAlignment=Enum.TextXAlignment.Center;arr.ZIndex=8;arr.Parent=sel
-    local dd=Instance.new("Frame");dd.Size=UDim2.new(1,0,0,0);dd.Position=UDim2.new(0,0,1,2);dd.BackgroundColor3=C.surface;dd.ZIndex=20;dd.ClipsDescendants=true;dd.Parent=wrap;rnd(dd,5);stk(dd,C.border,1)
-    local ddL=Instance.new("UIListLayout");ddL.SortOrder=Enum.SortOrder.LayoutOrder;ddL.Parent=dd
-    local function closeDd() open=false;tw(dd,{Size=UDim2.new(1,0,0,0)},0.15):Play() end
-    for _,opt in ipairs(options) do
-        local item=Instance.new("TextButton");item.Size=UDim2.new(1,0,0,24);item.BackgroundTransparency=1;item.Font=Enum.Font.GothamMedium;item.TextSize=12;item.TextColor3=C.textDim;item.Text="  "..opt;item.TextXAlignment=Enum.TextXAlignment.Left;item.ZIndex=21;item.Parent=dd
-        item.MouseEnter:Connect(function() tw(item,{TextColor3=C.text},0.1):Play() end)
-        item.MouseLeave:Connect(function() tw(item,{TextColor3=C.textDim},0.1):Play() end)
-        item.MouseButton1Click:Connect(function() sel.Text="  "..opt;callback(opt);closeDd() end)
-    end
-    sel.MouseButton1Click:Connect(function() open=not open;tw(dd,{Size=UDim2.new(1,0,0,open and #options*24 or 0)},0.15):Play() end)
-    return wrap
-end
+-- AIM TAB
+local p=Tabs["Aim"]
+local s1=sec(p,"SILENT AIM",1)
+tog(s1,"Silent Aim",Config.SilentAimEnabled,function(v) Config.SilentAimEnabled=v end,1)
+tog(s1,"Show Target Circle",Config.ShowCircle,function(v) Config.ShowCircle=v end,2)
+tog(s1,"Team Check",Config.TeamCheck,function(v) Config.TeamCheck=v end,3)
+slider(s1,"FOV Radius",10,400,Config.SilentAimFOV,function(v) Config.SilentAimFOV=v end,4)
+local s2=sec(p,"ONETAP",2)
+tog(s2,"Onetap (Remington 870 → AK-47/MP5)",Config.OnetapEnabled,function(v) Config.OnetapEnabled=v end,1)
+local s3=sec(p,"HITSOUND",3)
+tog(s3,"Hitsound",Config.HitsoundEnabled,function(v) Config.HitsoundEnabled=v end,1)
+inp(s3,"Sound ID",Config.HitsoundId,function(v) local id=tonumber(v);if id then Config.HitsoundId=id;HitSound.SoundId="rbxassetid://"..id end end,2)
 
--- ── BUILD CONTENT ──────────────────────────────────────────
+-- MAIN TAB
+local pm=Tabs["Main"]
+local sm=sec(pm,"FOG SHADER",1)
+tog(sm,"Enable Fog",Config.FogEnabled,function(v) Config.FogEnabled=v;applyFog() end,1)
+slider(sm,"Fog Start",0,500,Config.FogStart,function(v) Config.FogStart=v;applyFog() end,2)
+slider(sm,"Fog End",10,2000,Config.FogEnd,function(v) Config.FogEnd=v;applyFog() end,3)
+slider(sm,"Atmosphere Density",0,100,math.floor(Config.FogDensity*100),function(v) Config.FogDensity=v/100;applyFog() end,4)
 
--- AIM
-do
-    local p=Tabs["Aim"]
-    local s1=makeSection(p,"SILENT AIM",1)
-    makeToggle(s1,"Silent Aim",Config.SilentAimEnabled,function(v) Config.SilentAimEnabled=v end,1)
-    makeToggle(s1,"Show Target Circle",Config.ShowCircle,function(v) Config.ShowCircle=v end,2)
-    makeToggle(s1,"Team Check",Config.TeamCheck,function(v) Config.TeamCheck=v end,3)
-    makeSlider(s1,"FOV Radius",10,400,Config.SilentAimFOV,function(v) Config.SilentAimFOV=v end,4)
+-- RAGE TAB
+local pr=Tabs["Rage"]
+local sr=sec(pr,"SPIN",1)
+tog(sr,"Spin",Config.SpinEnabled,function(v) Config.SpinEnabled=v;if v then startSpin() else stopSpin() end end,1)
+slider(sr,"Spin Speed",1,60,Config.SpinSpeed,function(v) Config.SpinSpeed=v end,2)
 
-    local s2=makeSection(p,"ONETAP",2)
-    makeToggle(s2,"Onetap  (Remington 870 → AK-47 / MP5)",Config.OnetapEnabled,function(v) Config.OnetapEnabled=v end,1)
+-- SETTINGS TAB
+local ps=Tabs["Settings"]
+local ss=sec(ps,"INTERFACE",1)
+-- dropdown inline (упрощённый для Settings)
+local keyOpts={"RightShift","Insert","F4","Delete","Home"}
+local keyMap={RightShift=Enum.KeyCode.RightShift,Insert=Enum.KeyCode.Insert,F4=Enum.KeyCode.F4,Delete=Enum.KeyCode.Delete,Home=Enum.KeyCode.Home}
+local keyRow=Instance.new("Frame");keyRow.Size=UDim2.new(1,0,0,52);keyRow.BackgroundTransparency=1;keyRow.LayoutOrder=1;keyRow.ZIndex=5;keyRow.Parent=ss
+lbl(keyRow,"Menu Toggle Key",13,C.text,Enum.Font.GothamMedium).ZIndex=6
+local keyInp=Instance.new("TextBox");keyInp.Size=UDim2.new(1,0,0,26);keyInp.Position=UDim2.new(0,0,0,22);keyInp.BackgroundColor3=C.input_bg;keyInp.TextColor3=C.text;keyInp.Font=Enum.Font.Gotham;keyInp.TextSize=12;keyInp.Text="RightShift";keyInp.ClearTextOnFocus=false;keyInp.ZIndex=6;keyInp.Parent=keyRow;rnd(keyInp,5);stk(keyInp,C.border,1);pad(keyInp,8,0)
+keyInp.FocusLost:Connect(function() Config.MenuKey=keyMap[keyInp.Text] or Enum.KeyCode.RightShift end)
 
-    local s3=makeSection(p,"HITSOUND",3)
-    makeToggle(s3,"Hitsound",Config.HitsoundEnabled,function(v) Config.HitsoundEnabled=v end,1)
-    makeInput(s3,"Sound ID",Config.HitsoundId,function(v)
-        local id=tonumber(v)
-        if id then Config.HitsoundId=id;HitSound.SoundId="rbxassetid://"..id end
-    end,2)
-end
-
--- MAIN
-do
-    local p=Tabs["Main"]
-    local s1=makeSection(p,"FOG SHADER",1)
-    makeToggle(s1,"Enable Fog",Config.FogEnabled,function(v) Config.FogEnabled=v;applyFog() end,1)
-    makeSlider(s1,"Fog Start",0,500,Config.FogStart,function(v) Config.FogStart=v;applyFog() end,2)
-    makeSlider(s1,"Fog End",10,2000,Config.FogEnd,function(v) Config.FogEnd=v;applyFog() end,3)
-    makeSlider(s1,"Atmosphere Density",0,100,math.floor(Config.FogDensity*100),function(v) Config.FogDensity=v/100;applyFog() end,4)
-    makeDropdown(s1,"Fog Preset",{"Default","Dense Fog","Light Haze","Night Ambiance","Crimson"},"Default",function(opt)
-        local pr={
-            ["Default"]       ={Color3.fromRGB(180,200,220),0,  200, 0.15},
-            ["Dense Fog"]     ={Color3.fromRGB(160,160,160),0,  60,  0.6 },
-            ["Light Haze"]    ={Color3.fromRGB(220,220,200),100,600, 0.08},
-            ["Night Ambiance"]={Color3.fromRGB(20, 20, 60), 0,  150, 0.4 },
-            ["Crimson"]       ={Color3.fromRGB(80, 10, 10), 0,  100, 0.3 },
-        }
-        local v=pr[opt]; if v then Config.FogColor=v[1];Config.FogStart=v[2];Config.FogEnd=v[3];Config.FogDensity=v[4];Config.FogEnabled=true;applyFog() end
-    end,5)
-end
-
--- RAGE
-do
-    local p=Tabs["Rage"]
-    local s1=makeSection(p,"SPIN",1)
-    makeToggle(s1,"Spin",Config.SpinEnabled,function(v)
-        Config.SpinEnabled=v
-        if v then startSpin() else stopSpin() end
-    end,1)
-    makeSlider(s1,"Spin Speed",1,60,Config.SpinSpeed,function(v) Config.SpinSpeed=v end,2)
-end
-
--- SETTINGS
-do
-    local p=Tabs["Settings"]
-    local s1=makeSection(p,"INTERFACE",1)
-    makeDropdown(s1,"Menu Key",{"RightShift","Insert","F4","Delete","Home"},"RightShift",function(opt)
-        local m={RightShift=Enum.KeyCode.RightShift,Insert=Enum.KeyCode.Insert,F4=Enum.KeyCode.F4,Delete=Enum.KeyCode.Delete,Home=Enum.KeyCode.Home}
-        Config.MenuKey=m[opt] or Enum.KeyCode.RightShift
-    end,1)
-    local s2=makeSection(p,"INFO",2)
-    lbl(s2,"Prison Life Script  •  v1.1",12,C.textDim)
-    lbl(s2,"Solar / Solara / Synapse X / Electron",11,C.textDim)
+local sinfoSec=sec(ps,"INFO",2)
+lbl(sinfoSec,"Prison Life Script  •  v1.2",12,C.textDim)
+lbl(sinfoSec,"Solara / Synapse X / Electron",11,C.textDim)
+if namecallHooked then
+    lbl(sinfoSec,"✅ __namecall hook active",11,Color3.fromRGB(60,210,130))
+else
+    lbl(sinfoSec,"⚠️ hook failed — limited mode",11,Color3.fromRGB(255,180,60))
 end
 
 setTab("Aim")
 
--- Toggle menu
-local menuVisible=true
-UserInputService.InputBegan:Connect(function(inp,gp)
+-- toggle menu
+local menuVis=true
+UserInputService.InputBegan:Connect(function(i,gp)
     if gp then return end
-    if inp.KeyCode==Config.MenuKey then
-        menuVisible=not menuVisible
-        tw(Win,{Size=menuVisible and UDim2.new(0,560,0,380) or UDim2.new(0,560,0,0)},
-            0.2,Enum.EasingStyle.Back,menuVisible and Enum.EasingDirection.Out or Enum.EasingDirection.In):Play()
+    if i.KeyCode==Config.MenuKey then
+        menuVis=not menuVis
+        tw(Win,{Size=menuVis and UDim2.new(0,560,0,380) or UDim2.new(0,560,0,0)},.2,Enum.EasingStyle.Back,menuVis and Enum.EasingDirection.Out or Enum.EasingDirection.In):Play()
     end
 end)
 
-print("[PrisonLife v1.1] Loaded — toggle: "..Config.MenuKey.Name)
+print("[PrisonLife v1.2] Loaded | hook: " .. tostring(namecallHooked) .. " | key: " .. Config.MenuKey.Name)
